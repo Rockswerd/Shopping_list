@@ -1,4 +1,5 @@
 import os
+import asyncio
 from typing import Optional
 
 import httpx
@@ -44,9 +45,9 @@ def alice_response(
     }
 
 
-async def send_to_telegram(text: str) -> bool:
+async def send_to_telegram(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
+        return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     message_text = f"🛒 Покупки домой\n{text}"
@@ -58,15 +59,9 @@ async def send_to_telegram(text: str) -> bool:
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            if not data.get("ok"):
-                return False
+            await client.post(url, json=payload)
     except Exception:
-        return False
-
-    return True
+        pass
 
 
 @app.get("/")
@@ -100,12 +95,7 @@ async def webhook(payload: AliceRequest) -> dict:
             session_state={"stage": "awaiting_items"},
         )
 
-    if not await send_to_telegram(user_text):
-        return alice_response(
-            payload,
-            "Не получилось отправить список. Попробуйте еще раз",
-            session_state={"stage": "awaiting_items"},
-        )
+    asyncio.create_task(send_to_telegram(user_text))
 
     return alice_response(
         payload,
