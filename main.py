@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-FINISH_WORDS = {"завершить", "стоп", "хватит", "выход"}
+FINISH_WORDS = {"завершить", "стоп", "хватит", "выход", "закрыть", "отмена"}
 
 app = FastAPI(title="Покупки домой")
 
@@ -20,6 +20,12 @@ class AliceRequest(BaseModel):
     state: dict = Field(default_factory=dict)
 
 
+def extract_user_text(payload: AliceRequest) -> str:
+    command = (payload.request.get("command") or "").strip()
+    original_utterance = (payload.request.get("original_utterance") or "").strip()
+    return command or original_utterance
+
+
 def alice_response(
     request: AliceRequest,
     text: str,
@@ -27,7 +33,6 @@ def alice_response(
     end_session: bool = False,
     session_state: Optional[dict] = None,
 ) -> dict:
-    """Build a response in Yandex Dialogs webhook format."""
     return {
         "version": request.version,
         "session": request.session,
@@ -40,21 +45,33 @@ def alice_response(
 
 
 async def send_to_telegram(text: str) -> bool:
-    """Send the shopping item text to the configured Telegram chat."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    message_text = f"🛒 Покупки домой\n{text}"
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message_text,
+    }
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(url, json=payload)
             response.raise_for_status()
-    except httpx.HTTPError:
+            data = response.json()
+            if not data.get("ok"):
+                return False
+    except Exception:
         return False
 
     return True
+
+
+@app.get("/")
+async def healthcheck():
+    return {"status": "ok"}
 
 
 @app.post("/webhook")
@@ -66,13 +83,21 @@ async def webhook(payload: AliceRequest) -> dict:
             session_state={"stage": "awaiting_items"},
         )
 
-    user_text = payload.request.get("original_utterance", "").strip()
+    user_text = extract_user_text(payload)
+    normalized_text = user_text.lower().strip()
 
-    if user_text.lower() in FINISH_WORDS:
+    if normalized_text in FINISH_WORDS:
         return alice_response(
             payload,
             "Хорошо, закрываю список",
             end_session=True,
+        )
+
+    if not user_text:
+        return alice_response(
+            payload,
+            "Я не расслышала. Скажите, что добавить, или скажите завершить",
+            session_state={"stage": "awaiting_items"},
         )
 
     if not await send_to_telegram(user_text):
