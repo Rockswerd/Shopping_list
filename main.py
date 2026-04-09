@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 from typing import Optional
 
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 FINISH_WORDS = {"завершить", "стоп", "хватит", "выход", "закрыть", "отмена"}
 
 app = FastAPI(title="Покупки домой")
@@ -20,6 +22,60 @@ class AliceRequest(BaseModel):
     version: str
     state: dict = Field(default_factory=dict)
 
+
+# ----------- УМНАЯ ОБРАБОТКА -----------
+
+def normalize_shopping_text(text: str) -> str:
+    text = text.strip().lower()
+
+    prefixes = [
+        "добавь в список покупок",
+        "добавь в список",
+        "запиши в список покупок",
+        "запиши в список",
+        "запиши",
+        "добавь",
+        "купи",
+        "нужно купить",
+        "надо купить",
+    ]
+
+    for prefix in prefixes:
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+
+    return text
+
+
+def parse_items(text: str) -> list[str]:
+    text = normalize_shopping_text(text)
+
+    # Нормализуем разделители
+    text = text.replace(";", ",")
+    text = re.sub(r"\s+и\s+", ", ", text)
+
+    # Убираем лишние пробелы и запятые
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r",\s*,+", ",", text).strip(" ,")
+
+    parts = [part.strip(" .,!?:;") for part in text.split(",")]
+
+    items = [part for part in parts if part]
+
+    return items
+
+
+def format_items_for_telegram(items: list[str]) -> str:
+    if not items:
+        return "🛒 Покупки домой\n- пусто"
+
+    lines = ["🛒 Покупки домой"]
+    lines.extend(f"- {item}" for item in items)
+    return "\n".join(lines)
+
+
+# ----------- ОСНОВНАЯ ЛОГИКА -----------
 
 def extract_user_text(payload: AliceRequest) -> str:
     command = (payload.request.get("command") or "").strip()
@@ -50,7 +106,9 @@ async def send_to_telegram(text: str) -> None:
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    message_text = f"🛒 Покупки домой\n{text}"
+
+    items = parse_items(text)
+    message_text = format_items_for_telegram(items)
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -95,6 +153,7 @@ async def webhook(payload: AliceRequest) -> dict:
             session_state={"stage": "awaiting_items"},
         )
 
+    # 🚀 отправка в фоне (без ожидания)
     asyncio.create_task(send_to_telegram(user_text))
 
     return alice_response(
