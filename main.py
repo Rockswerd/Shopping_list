@@ -1,11 +1,16 @@
 import os
 import re
-import asyncio
+from datetime import datetime
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -18,6 +23,8 @@ FINISH_WORDS = {
     "выход",
     "закрыть",
     "отмена",
+    "все",
+    "готово",
 }
 
 FILLER_PATTERNS = [
@@ -45,10 +52,23 @@ class AliceRequest(BaseModel):
     state: dict = Field(default_factory=dict)
 
 
+def now_date_string() -> str:
+    try:
+        if ZoneInfo is not None:
+            return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y")
+    except Exception:
+        pass
+    return datetime.now().strftime("%d.%m.%Y")
+
+
 def extract_user_text(payload: AliceRequest) -> str:
     command = (payload.request.get("command") or "").strip()
     original_utterance = (payload.request.get("original_utterance") or "").strip()
     return command or original_utterance
+
+
+def get_session_state(payload: AliceRequest) -> dict:
+    return payload.state.get("session", {}) or {}
 
 
 def alice_response(
@@ -58,15 +78,19 @@ def alice_response(
     end_session: bool = False,
     session_state: Optional[dict] = None,
 ) -> dict:
-    return {
+    response = {
         "version": request.version,
         "session": request.session,
         "response": {
             "text": text,
             "end_session": end_session,
         },
-        "session_state": session_state or {},
     }
+
+    if session_state is not None:
+        response["session_state"] = session_state
+
+    return response
 
 
 def clean_text(text: str) -> str:
@@ -88,24 +112,13 @@ def clean_text(text: str) -> str:
 
 
 def split_short_plain_list(text: str) -> list[str]:
-    """
-    Если человек сказал короткое перечисление без запятых:
-    'сыр колбаса хлеб'
-    то считаем это списком отдельных товаров.
-
-    Но длинные фразы не режем, чтобы не ломать:
-    'таблетки для посудомойки'
-    'приправа для болоньезе'
-    """
     words = text.split()
 
     if len(words) <= 1:
         return [text] if text else []
 
-    # Если слов 2-4 и все слова короткие/обычные, скорее всего это перечисление
-    if 2 <= len(words) <= 4:
-        if all(len(word) <= 12 for word in words):
-            return words
+    if 2 <= len(words) <= 4 and all(len(word) <= 12 for word in words):
+        return words
 
     return [text]
 
@@ -131,33 +144,68 @@ def parse_items(text: str) -> list[str]:
     return cleaned_parts
 
 
-def format_items_for_telegram(items: list[str]) -> str:
+def build_telegram_message(items: list[str]) -> str:
+    title = f"🛒 Список покупок - {now_date_string()}"
     if not items:
-        return "🛒 Покупки домой\n- пусто"
+        return f"{title}\n- пусто"
 
-    lines = ["🛒 Покупки домой"]
+    lines = [title]
     lines.extend(f"- {item}" for item in items)
     return "\n".join(lines)
 
 
-async def send_to_telegram(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+async def telegram_api_call(method: str, payload: dict) -> dict:
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
-    items = parse_items(text)
-    message_text = format_items_for_telegram(items)
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message_text,
-    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data}")
+
+    return data
+
+
+async def upsert_telegram_list(items: list[str], message_id: Optional[int]) -> Optional[int]:
+    if not TELEGRAM_CHAT_ID:
+        return None
+
+    text = build_telegram_message(items)
+
+    if message_id is None:
+        data = await telegram_api_call(
+            "sendMessage",
+            {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+            },
+        )
+        return data["result"]["message_id"]
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json=payload)
+        await telegram_api_call(
+            "editMessageText",
+            {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "message_id": message_id,
+                "text": text,
+            },
+        )
+        return message_id
     except Exception:
-        pass
+        data = await telegram_api_call(
+            "sendMessage",
+            {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+            },
+        )
+        return data["result"]["message_id"]
 
 
 @app.get("/")
@@ -167,20 +215,56 @@ async def healthcheck():
 
 @app.post("/webhook")
 async def webhook(payload: AliceRequest) -> dict:
+    current_state = get_session_state(payload)
+
     if payload.session.get("new"):
         return alice_response(
             payload,
             "Говорите, что добавить в список покупок",
-            session_state={"stage": "awaiting_items"},
+            session_state={
+                "stage": "awaiting_items",
+                "items": [],
+                "telegram_message_id": None,
+            },
         )
 
     user_text = extract_user_text(payload)
     normalized_text = user_text.lower().strip()
 
+    items = current_state.get("items", [])
+    if not isinstance(items, list):
+        items = []
+
+    telegram_message_id = current_state.get("telegram_message_id")
+    if not isinstance(telegram_message_id, int):
+        telegram_message_id = None
+
     if normalized_text in FINISH_WORDS:
+        if not items:
+            return alice_response(
+                payload,
+                "Список пустой. Закрываю",
+                end_session=True,
+            )
+
+        if telegram_message_id is None:
+            try:
+                telegram_message_id = await upsert_telegram_list(items, None)
+            except Exception:
+                return alice_response(
+                    payload,
+                    "Не получилось сохранить список в Телеграм. Попробуйте еще раз",
+                    end_session=False,
+                    session_state={
+                        "stage": "awaiting_items",
+                        "items": items,
+                        "telegram_message_id": telegram_message_id,
+                    },
+                )
+
         return alice_response(
             payload,
-            "Хорошо, закрываю список",
+            "Готово. Список сохранен",
             end_session=True,
         )
 
@@ -188,13 +272,49 @@ async def webhook(payload: AliceRequest) -> dict:
         return alice_response(
             payload,
             "Я не расслышала. Скажите, что добавить, или скажите завершить",
-            session_state={"stage": "awaiting_items"},
+            session_state={
+                "stage": "awaiting_items",
+                "items": items,
+                "telegram_message_id": telegram_message_id,
+            },
         )
 
-    asyncio.create_task(send_to_telegram(user_text))
+    new_items = parse_items(user_text)
+    if not new_items:
+        return alice_response(
+            payload,
+            "Не поняла, что добавить. Скажите товар еще раз",
+            session_state={
+                "stage": "awaiting_items",
+                "items": items,
+                "telegram_message_id": telegram_message_id,
+            },
+        )
+
+    items = items + new_items
+
+    try:
+        telegram_message_id = await upsert_telegram_list(items, telegram_message_id)
+    except Exception:
+        return alice_response(
+            payload,
+            "Не получилось обновить список в Телеграм. Попробуйте еще раз",
+            end_session=False,
+            session_state={
+                "stage": "awaiting_items",
+                "items": items,
+                "telegram_message_id": telegram_message_id,
+            },
+        )
+
+    added_text = ", ".join(new_items)
 
     return alice_response(
         payload,
-        "Добавила. Говорите еще или скажите завершить",
-        session_state={"stage": "awaiting_items"},
+        f"Добавила: {added_text}. Говорите еще или скажите завершить",
+        session_state={
+            "stage": "awaiting_items",
+            "items": items,
+            "telegram_message_id": telegram_message_id,
+        },
     )
