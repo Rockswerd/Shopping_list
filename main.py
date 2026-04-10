@@ -11,7 +11,29 @@ from pydantic import BaseModel, Field
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-FINISH_WORDS = {"завершить", "стоп", "хватит", "выход", "закрыть", "отмена"}
+FINISH_WORDS = {
+    "завершить",
+    "стоп",
+    "хватит",
+    "выход",
+    "закрыть",
+    "отмена",
+}
+
+FILLER_PATTERNS = [
+    r"\bалиса\b",
+    r"\bпожалуйста\b",
+    r"\bдобавь\b",
+    r"\bдобавить\b",
+    r"\bзапиши\b",
+    r"\bзаписать\b",
+    r"\bкупи\b",
+    r"\bкупить\b",
+    r"\bв\s+список\s+покупок\b",
+    r"\bв\s+список\b",
+    r"\bсписок\s+покупок\b",
+    r"\bмне\b",
+]
 
 app = FastAPI(title="Покупки домой")
 
@@ -22,60 +44,6 @@ class AliceRequest(BaseModel):
     version: str
     state: dict = Field(default_factory=dict)
 
-
-# ----------- УМНАЯ ОБРАБОТКА -----------
-
-def normalize_shopping_text(text: str) -> str:
-    text = text.strip().lower()
-
-    prefixes = [
-        "добавь в список покупок",
-        "добавь в список",
-        "запиши в список покупок",
-        "запиши в список",
-        "запиши",
-        "добавь",
-        "купи",
-        "нужно купить",
-        "надо купить",
-    ]
-
-    for prefix in prefixes:
-        if text.startswith(prefix):
-            text = text[len(prefix):].strip()
-            break
-
-    return text
-
-
-def parse_items(text: str) -> list[str]:
-    text = normalize_shopping_text(text)
-
-    # Нормализуем разделители
-    text = text.replace(";", ",")
-    text = re.sub(r"\s+и\s+", ", ", text)
-
-    # Убираем лишние пробелы и запятые
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r",\s*,+", ",", text).strip(" ,")
-
-    parts = [part.strip(" .,!?:;") for part in text.split(",")]
-
-    items = [part for part in parts if part]
-
-    return items
-
-
-def format_items_for_telegram(items: list[str]) -> str:
-    if not items:
-        return "🛒 Покупки домой\n- пусто"
-
-    lines = ["🛒 Покупки домой"]
-    lines.extend(f"- {item}" for item in items)
-    return "\n".join(lines)
-
-
-# ----------- ОСНОВНАЯ ЛОГИКА -----------
 
 def extract_user_text(payload: AliceRequest) -> str:
     command = (payload.request.get("command") or "").strip()
@@ -101,15 +69,85 @@ def alice_response(
     }
 
 
+def clean_text(text: str) -> str:
+    text = text.lower().strip()
+
+    for pattern in FILLER_PATTERNS:
+        text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
+
+    text = text.replace(";", ",")
+    text = text.replace(" ещё ", ", ")
+    text = text.replace(" еще ", ", ")
+
+    text = re.sub(r"\s+и\s+", ", ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r"(,\s*){2,}", ", ", text)
+
+    return text.strip(" ,.!?:;")
+
+
+def split_short_plain_list(text: str) -> list[str]:
+    """
+    Если человек сказал короткое перечисление без запятых:
+    'сыр колбаса хлеб'
+    то считаем это списком отдельных товаров.
+
+    Но длинные фразы не режем, чтобы не ломать:
+    'таблетки для посудомойки'
+    'приправа для болоньезе'
+    """
+    words = text.split()
+
+    if len(words) <= 1:
+        return [text] if text else []
+
+    # Если слов 2-4 и все слова короткие/обычные, скорее всего это перечисление
+    if 2 <= len(words) <= 4:
+        if all(len(word) <= 12 for word in words):
+            return words
+
+    return [text]
+
+
+def parse_items(text: str) -> list[str]:
+    text = clean_text(text)
+
+    if not text:
+        return []
+
+    if "," in text:
+        raw_parts = [part.strip(" .,!?:;") for part in text.split(",")]
+        parts = [part for part in raw_parts if part]
+    else:
+        parts = split_short_plain_list(text)
+
+    cleaned_parts = []
+    for part in parts:
+        part = re.sub(r"\s+", " ", part).strip(" .,!?:;")
+        if part:
+            cleaned_parts.append(part)
+
+    return cleaned_parts
+
+
+def format_items_for_telegram(items: list[str]) -> str:
+    if not items:
+        return "🛒 Покупки домой\n- пусто"
+
+    lines = ["🛒 Покупки домой"]
+    lines.extend(f"- {item}" for item in items)
+    return "\n".join(lines)
+
+
 async def send_to_telegram(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
     items = parse_items(text)
     message_text = format_items_for_telegram(items)
 
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message_text,
@@ -153,7 +191,6 @@ async def webhook(payload: AliceRequest) -> dict:
             session_state={"stage": "awaiting_items"},
         )
 
-    # 🚀 отправка в фоне (без ожидания)
     asyncio.create_task(send_to_telegram(user_text))
 
     return alice_response(
