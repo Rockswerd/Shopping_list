@@ -44,8 +44,13 @@ FILLER_PATTERNS = [
 
 app = FastAPI(title="Покупки домой")
 
-# Хранилище активных сессий в памяти:
-# session_id -> {"items": [...], "telegram_message_id": 123}
+# Хранилище активных сессий в памяти
+# session_id -> {
+#   "items": [...],
+#   "telegram_message_id": 123,
+#   "last_processed_message_id": 5,
+#   "last_response_text": "..."
+# }
 ACTIVE_SESSIONS: dict[str, dict] = {}
 
 
@@ -73,6 +78,10 @@ def extract_user_text(payload: AliceRequest) -> str:
 
 def get_session_id(payload: AliceRequest) -> str:
     return str(payload.session.get("session_id", ""))
+
+
+def get_message_id(payload: AliceRequest) -> int:
+    return int(payload.session.get("message_id", 0))
 
 
 def alice_response(
@@ -106,8 +115,6 @@ def clean_text(text: str) -> str:
     text = text.replace(";", ",")
     text = text.replace(" ещё ", ", ")
     text = text.replace(" еще ", ", ")
-
-    # "и" считаем разделителем только если это похоже на перечисление
     text = re.sub(r"\s+и\s+", ", ", text, flags=re.IGNORECASE)
 
     text = re.sub(r"\s+", " ", text)
@@ -123,8 +130,6 @@ def split_short_plain_list(text: str) -> list[str]:
     if len(words) <= 1:
         return [text] if text else []
 
-    # Если 2-4 коротких слова без запятых,
-    # считаем, что это перечисление отдельных товаров.
     if 2 <= len(words) <= 4 and all(len(word) <= 12 for word in words):
         return words
 
@@ -206,7 +211,6 @@ async def upsert_telegram_list(items: list[str], message_id: Optional[int]) -> i
         )
         return message_id
     except Exception:
-        # Если редактирование не удалось, создаем новое сообщение
         data = await telegram_api_call(
             "sendMessage",
             {
@@ -225,6 +229,8 @@ async def healthcheck():
 @app.post("/webhook")
 async def webhook(payload: AliceRequest) -> dict:
     session_id = get_session_id(payload)
+    message_id = get_message_id(payload)
+
     if not session_id:
         return alice_response(
             payload,
@@ -232,11 +238,12 @@ async def webhook(payload: AliceRequest) -> dict:
             end_session=True,
         )
 
-    # Инициализация сессии
     if payload.session.get("new"):
         ACTIVE_SESSIONS[session_id] = {
             "items": [],
             "telegram_message_id": None,
+            "last_processed_message_id": None,
+            "last_response_text": "Говорите, что добавить в список покупок",
         }
         return alice_response(
             payload,
@@ -246,8 +253,22 @@ async def webhook(payload: AliceRequest) -> dict:
 
     session_data = ACTIVE_SESSIONS.get(
         session_id,
-        {"items": [], "telegram_message_id": None},
+        {
+            "items": [],
+            "telegram_message_id": None,
+            "last_processed_message_id": None,
+            "last_response_text": "Говорите, что добавить в список покупок",
+        },
     )
+
+    # Защита от дублей
+    if session_data.get("last_processed_message_id") == message_id:
+        return alice_response(
+            payload,
+            session_data.get("last_response_text", "Хорошо"),
+            end_session=False,
+            session_state={"stage": "awaiting_items"},
+        )
 
     items = session_data.get("items", [])
     telegram_message_id = session_data.get("telegram_message_id")
@@ -266,14 +287,17 @@ async def webhook(payload: AliceRequest) -> dict:
 
         try:
             telegram_message_id = await upsert_telegram_list(items, telegram_message_id)
+        except Exception:
+            response_text = "Не получилось сохранить список в Телеграм. Попробуйте еще раз"
             ACTIVE_SESSIONS[session_id] = {
                 "items": items,
                 "telegram_message_id": telegram_message_id,
+                "last_processed_message_id": message_id,
+                "last_response_text": response_text,
             }
-        except Exception:
             return alice_response(
                 payload,
-                "Не получилось сохранить список в Телеграм. Попробуйте еще раз",
+                response_text,
                 end_session=False,
                 session_state={"stage": "awaiting_items"},
             )
@@ -286,17 +310,31 @@ async def webhook(payload: AliceRequest) -> dict:
         )
 
     if not user_text:
+        response_text = "Я не расслышала. Скажите, что добавить, или скажите завершить"
+        ACTIVE_SESSIONS[session_id] = {
+            "items": items,
+            "telegram_message_id": telegram_message_id,
+            "last_processed_message_id": message_id,
+            "last_response_text": response_text,
+        }
         return alice_response(
             payload,
-            "Я не расслышала. Скажите, что добавить, или скажите завершить",
+            response_text,
             session_state={"stage": "awaiting_items"},
         )
 
     new_items = parse_items(user_text)
     if not new_items:
+        response_text = "Не поняла, что добавить. Скажите товар еще раз"
+        ACTIVE_SESSIONS[session_id] = {
+            "items": items,
+            "telegram_message_id": telegram_message_id,
+            "last_processed_message_id": message_id,
+            "last_response_text": response_text,
+        }
         return alice_response(
             payload,
-            "Не поняла, что добавить. Скажите товар еще раз",
+            response_text,
             session_state={"stage": "awaiting_items"},
         )
 
@@ -305,22 +343,32 @@ async def webhook(payload: AliceRequest) -> dict:
     try:
         telegram_message_id = await upsert_telegram_list(items, telegram_message_id)
     except Exception:
+        response_text = "Не получилось обновить список в Телеграм. Попробуйте еще раз"
+        ACTIVE_SESSIONS[session_id] = {
+            "items": items,
+            "telegram_message_id": telegram_message_id,
+            "last_processed_message_id": message_id,
+            "last_response_text": response_text,
+        }
         return alice_response(
             payload,
-            "Не получилось обновить список в Телеграм. Попробуйте еще раз",
+            response_text,
             end_session=False,
             session_state={"stage": "awaiting_items"},
         )
 
+    added_text = ", ".join(new_items)
+    response_text = f"Добавила: {added_text}. Говорите еще или скажите завершить"
+
     ACTIVE_SESSIONS[session_id] = {
         "items": items,
         "telegram_message_id": telegram_message_id,
+        "last_processed_message_id": message_id,
+        "last_response_text": response_text,
     }
-
-    added_text = ", ".join(new_items)
 
     return alice_response(
         payload,
-        f"Добавила: {added_text}. Говорите еще или скажите завершить",
+        response_text,
         session_state={"stage": "awaiting_items"},
     )
