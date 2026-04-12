@@ -46,10 +46,11 @@ app = FastAPI(title="Покупки домой")
 
 # Хранилище активных сессий в памяти
 # session_id -> {
-#   "items": [...],
-#   "telegram_message_id": 123,
-#   "last_processed_message_id": 5,
-#   "last_response_text": "..."
+#   "items": list[str],
+#   "telegram_message_id": Optional[int],
+#   "last_processed_message_id": Optional[int],
+#   "last_response_text": str,
+#   "last_end_session": bool,
 # }
 ACTIVE_SESSIONS: dict[str, dict] = {}
 
@@ -130,6 +131,8 @@ def split_short_plain_list(text: str) -> list[str]:
     if len(words) <= 1:
         return [text] if text else []
 
+    # Если 2-4 коротких слова без запятых,
+    # считаем это перечислением отдельных товаров.
     if 2 <= len(words) <= 4 and all(len(word) <= 12 for word in words):
         return words
 
@@ -179,7 +182,8 @@ async def telegram_api_call(method: str, payload: dict) -> dict:
         data = response.json()
 
     if not data.get("ok"):
-        raise RuntimeError(f"Telegram API error: {data}")
+        description = data.get("description", "Unknown Telegram API error")
+        raise RuntimeError(f"Telegram API error in {method}: {description}")
 
     return data
 
@@ -190,6 +194,7 @@ async def upsert_telegram_list(items: list[str], message_id: Optional[int]) -> i
 
     text = build_telegram_message(items)
 
+    # Первое сообщение в сессии
     if message_id is None:
         data = await telegram_api_call(
             "sendMessage",
@@ -200,6 +205,7 @@ async def upsert_telegram_list(items: list[str], message_id: Optional[int]) -> i
         )
         return int(data["result"]["message_id"])
 
+    # Дальше только редактируем уже существующее сообщение
     try:
         await telegram_api_call(
             "editMessageText",
@@ -210,15 +216,28 @@ async def upsert_telegram_list(items: list[str], message_id: Optional[int]) -> i
             },
         )
         return message_id
-    except Exception:
-        data = await telegram_api_call(
-            "sendMessage",
-            {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
-            },
-        )
-        return int(data["result"]["message_id"])
+    except RuntimeError as exc:
+        error_text = str(exc).lower()
+
+        # Это не ошибка по сути. Просто текст не изменился.
+        if "message is not modified" in error_text:
+            return message_id
+
+        # Здесь принципиально НЕ создаем новое сообщение,
+        # чтобы не плодить дубли.
+        raise
+
+
+def get_or_create_session_data(session_id: str) -> dict:
+    if session_id not in ACTIVE_SESSIONS:
+        ACTIVE_SESSIONS[session_id] = {
+            "items": [],
+            "telegram_message_id": None,
+            "last_processed_message_id": None,
+            "last_response_text": "Говорите, что добавить в список покупок",
+            "last_end_session": False,
+        }
+    return ACTIVE_SESSIONS[session_id]
 
 
 @app.get("/")
@@ -238,12 +257,14 @@ async def webhook(payload: AliceRequest) -> dict:
             end_session=True,
         )
 
+    # Новая сессия
     if payload.session.get("new"):
         ACTIVE_SESSIONS[session_id] = {
             "items": [],
             "telegram_message_id": None,
             "last_processed_message_id": None,
             "last_response_text": "Говорите, что добавить в список покупок",
+            "last_end_session": False,
         }
         return alice_response(
             payload,
@@ -251,23 +272,15 @@ async def webhook(payload: AliceRequest) -> dict:
             session_state={"stage": "awaiting_items"},
         )
 
-    session_data = ACTIVE_SESSIONS.get(
-        session_id,
-        {
-            "items": [],
-            "telegram_message_id": None,
-            "last_processed_message_id": None,
-            "last_response_text": "Говорите, что добавить в список покупок",
-        },
-    )
+    session_data = get_or_create_session_data(session_id)
 
-    # Защита от дублей
+    # Защита от дублей одного и того же запроса
     if session_data.get("last_processed_message_id") == message_id:
         return alice_response(
             payload,
             session_data.get("last_response_text", "Хорошо"),
-            end_session=False,
-            session_state={"stage": "awaiting_items"},
+            end_session=session_data.get("last_end_session", False),
+            session_state={"stage": "awaiting_items"} if not session_data.get("last_end_session", False) else None,
         )
 
     items = session_data.get("items", [])
@@ -276,6 +289,7 @@ async def webhook(payload: AliceRequest) -> dict:
     user_text = extract_user_text(payload)
     normalized_text = user_text.lower().strip()
 
+    # Завершение
     if normalized_text in FINISH_WORDS:
         if not items:
             ACTIVE_SESSIONS.pop(session_id, None)
@@ -289,12 +303,10 @@ async def webhook(payload: AliceRequest) -> dict:
             telegram_message_id = await upsert_telegram_list(items, telegram_message_id)
         except Exception:
             response_text = "Не получилось сохранить список в Телеграм. Попробуйте еще раз"
-            ACTIVE_SESSIONS[session_id] = {
-                "items": items,
-                "telegram_message_id": telegram_message_id,
-                "last_processed_message_id": message_id,
-                "last_response_text": response_text,
-            }
+            session_data["telegram_message_id"] = telegram_message_id
+            session_data["last_processed_message_id"] = message_id
+            session_data["last_response_text"] = response_text
+            session_data["last_end_session"] = False
             return alice_response(
                 payload,
                 response_text,
@@ -311,12 +323,9 @@ async def webhook(payload: AliceRequest) -> dict:
 
     if not user_text:
         response_text = "Я не расслышала. Скажите, что добавить, или скажите завершить"
-        ACTIVE_SESSIONS[session_id] = {
-            "items": items,
-            "telegram_message_id": telegram_message_id,
-            "last_processed_message_id": message_id,
-            "last_response_text": response_text,
-        }
+        session_data["last_processed_message_id"] = message_id
+        session_data["last_response_text"] = response_text
+        session_data["last_end_session"] = False
         return alice_response(
             payload,
             response_text,
@@ -326,12 +335,9 @@ async def webhook(payload: AliceRequest) -> dict:
     new_items = parse_items(user_text)
     if not new_items:
         response_text = "Не поняла, что добавить. Скажите товар еще раз"
-        ACTIVE_SESSIONS[session_id] = {
-            "items": items,
-            "telegram_message_id": telegram_message_id,
-            "last_processed_message_id": message_id,
-            "last_response_text": response_text,
-        }
+        session_data["last_processed_message_id"] = message_id
+        session_data["last_response_text"] = response_text
+        session_data["last_end_session"] = False
         return alice_response(
             payload,
             response_text,
@@ -344,12 +350,11 @@ async def webhook(payload: AliceRequest) -> dict:
         telegram_message_id = await upsert_telegram_list(items, telegram_message_id)
     except Exception:
         response_text = "Не получилось обновить список в Телеграм. Попробуйте еще раз"
-        ACTIVE_SESSIONS[session_id] = {
-            "items": items,
-            "telegram_message_id": telegram_message_id,
-            "last_processed_message_id": message_id,
-            "last_response_text": response_text,
-        }
+        session_data["items"] = items
+        session_data["telegram_message_id"] = telegram_message_id
+        session_data["last_processed_message_id"] = message_id
+        session_data["last_response_text"] = response_text
+        session_data["last_end_session"] = False
         return alice_response(
             payload,
             response_text,
@@ -360,12 +365,11 @@ async def webhook(payload: AliceRequest) -> dict:
     added_text = ", ".join(new_items)
     response_text = f"Добавила: {added_text}. Говорите еще или скажите завершить"
 
-    ACTIVE_SESSIONS[session_id] = {
-        "items": items,
-        "telegram_message_id": telegram_message_id,
-        "last_processed_message_id": message_id,
-        "last_response_text": response_text,
-    }
+    session_data["items"] = items
+    session_data["telegram_message_id"] = telegram_message_id
+    session_data["last_processed_message_id"] = message_id
+    session_data["last_response_text"] = response_text
+    session_data["last_end_session"] = False
 
     return alice_response(
         payload,
