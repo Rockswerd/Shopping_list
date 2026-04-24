@@ -44,13 +44,6 @@ FILLER_PATTERNS = [
 
 app = FastAPI(title="Покупки домой")
 
-# session_id -> {
-#   "items": list[str],
-#   "telegram_message_id": Optional[int],
-#   "last_processed_message_id": Optional[int],
-#   "last_response_text": str,
-#   "last_end_session": bool,
-# }
 ACTIVE_SESSIONS: dict[str, dict] = {}
 
 
@@ -59,6 +52,10 @@ class AliceRequest(BaseModel):
     session: dict
     version: str
     state: dict = Field(default_factory=dict)
+
+
+def log(message: str):
+    print(message, flush=True)
 
 
 def now_date_string() -> str:
@@ -173,10 +170,21 @@ async def telegram_api_call(method: str, payload: dict) -> dict:
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
+    safe_payload = dict(payload)
+    if "chat_id" in safe_payload:
+        safe_payload["chat_id"] = str(safe_payload["chat_id"])
+
+    log(f"TELEGRAM REQUEST METHOD: {method}")
+    log(f"TELEGRAM REQUEST PAYLOAD: {safe_payload}")
+
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
+
+    log(f"TELEGRAM HTTP STATUS: {response.status_code}")
+    log(f"TELEGRAM RAW RESPONSE: {response.text}")
+
+    response.raise_for_status()
+    data = response.json()
 
     if not data.get("ok"):
         description = data.get("description", "Unknown Telegram API error")
@@ -192,6 +200,7 @@ async def upsert_telegram_list(items: list[str], message_id: Optional[int]) -> i
     text = build_telegram_message(items)
 
     if message_id is None:
+        log("TELEGRAM ACTION: sendMessage because message_id is None")
         data = await telegram_api_call(
             "sendMessage",
             {
@@ -199,7 +208,11 @@ async def upsert_telegram_list(items: list[str], message_id: Optional[int]) -> i
                 "text": text,
             },
         )
-        return int(data["result"]["message_id"])
+        new_message_id = int(data["result"]["message_id"])
+        log(f"TELEGRAM NEW MESSAGE_ID: {new_message_id}")
+        return new_message_id
+
+    log(f"TELEGRAM ACTION: editMessageText message_id={message_id}")
 
     try:
         await telegram_api_call(
@@ -211,12 +224,19 @@ async def upsert_telegram_list(items: list[str], message_id: Optional[int]) -> i
             },
         )
         return message_id
+
     except RuntimeError as exc:
         error_text = str(exc).lower()
+        log(f"TELEGRAM EDIT ERROR: {str(exc)}")
 
         if "message is not modified" in error_text:
+            log("TELEGRAM EDIT IGNORED: message is not modified")
             return message_id
 
+        raise
+
+    except Exception as exc:
+        log(f"TELEGRAM UNEXPECTED ERROR: {repr(exc)}")
         raise
 
 
@@ -242,6 +262,9 @@ async def webhook(payload: AliceRequest) -> dict:
     session_id = get_session_id(payload)
     message_id = get_message_id(payload)
 
+    log(f"ALICE REQUEST: session_id={session_id}, message_id={message_id}, new={payload.session.get('new')}")
+    log(f"ALICE TEXT: {extract_user_text(payload)}")
+
     if not session_id:
         return alice_response(
             payload,
@@ -266,6 +289,7 @@ async def webhook(payload: AliceRequest) -> dict:
     session_data = get_or_create_session_data(session_id)
 
     if session_data.get("last_processed_message_id") == message_id:
+        log("ALICE DUPLICATE REQUEST IGNORED")
         return alice_response(
             payload,
             session_data.get("last_response_text", "Хорошо"),
@@ -288,8 +312,6 @@ async def webhook(payload: AliceRequest) -> dict:
                 end_session=True,
             )
 
-        # НИЧЕГО НЕ ШЛЕМ В TELEGRAM НА ЭТАПЕ ЗАВЕРШЕНИЯ
-        # Список уже сохранен и обновлен на предыдущих шагах.
         ACTIVE_SESSIONS.pop(session_id, None)
         return alice_response(
             payload,
@@ -309,6 +331,8 @@ async def webhook(payload: AliceRequest) -> dict:
         )
 
     new_items = parse_items(user_text)
+    log(f"PARSED ITEMS: {new_items}")
+
     if not new_items:
         response_text = "Не поняла, что добавить. Скажите товар еще раз"
         session_data["last_processed_message_id"] = message_id
@@ -324,7 +348,9 @@ async def webhook(payload: AliceRequest) -> dict:
 
     try:
         telegram_message_id = await upsert_telegram_list(items, telegram_message_id)
-    except Exception:
+    except Exception as exc:
+        log(f"FINAL TELEGRAM ERROR: {repr(exc)}")
+
         response_text = "Не получилось обновить список в Телеграм. Попробуйте еще раз"
         session_data["items"] = items
         session_data["telegram_message_id"] = telegram_message_id
@@ -346,6 +372,8 @@ async def webhook(payload: AliceRequest) -> dict:
     session_data["last_processed_message_id"] = message_id
     session_data["last_response_text"] = response_text
     session_data["last_end_session"] = False
+
+    log(f"SESSION UPDATED: items={items}, telegram_message_id={telegram_message_id}")
 
     return alice_response(
         payload,
