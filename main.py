@@ -175,6 +175,22 @@ QUANTITY_WORDS = {
     "штук",
 }
 
+ADJECTIVE_ENDINGS = (
+    "ый",
+    "ий",
+    "ой",
+    "ая",
+    "яя",
+    "ое",
+    "ее",
+    "ые",
+    "ие",
+    "ого",
+    "его",
+    "ую",
+    "юю",
+)
+
 app = FastAPI(title="Покупки домой")
 
 ACTIVE_SESSIONS: dict[str, dict] = {}
@@ -290,11 +306,24 @@ def split_short_plain_list(text: str) -> list[str]:
     if len(words) <= 1:
         return [text] if text else []
 
-    if any(word.isdigit() or word in QUANTITY_WORDS for word in words):
+    if any(re.search(r"\d", word) or word in QUANTITY_WORDS for word in words):
         return [text]
 
     if 2 <= len(words) <= 4 and all(len(word) <= 12 for word in words):
-        return words
+        grouped_words = []
+        index = 0
+
+        while index < len(words):
+            word = words[index]
+
+            if index + 1 < len(words) and word.endswith(ADJECTIVE_ENDINGS):
+                grouped_words.append(f"{word} {words[index + 1]}")
+                index += 2
+            else:
+                grouped_words.append(word)
+                index += 1
+
+        return grouped_words
 
     return [text]
 

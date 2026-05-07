@@ -32,6 +32,12 @@ def test_parse_items_handles_fillers_lists_quantities_and_negative_phrases():
     assert main.parse_items("не добавляй хлеб, добавь молоко") == ["молоко"]
 
 
+def test_parse_items_keeps_adjective_product_names_together():
+    assert main.parse_items("оливковое масло") == ["оливковое масло"]
+    assert main.parse_items("добавь крабовые палочки") == ["крабовые палочки"]
+    assert main.parse_items("оливковое масло клубнику кабачки") == ["оливковое масло", "клубнику", "кабачки"]
+
+
 def test_build_telegram_message_uses_markdown_and_escapes_items(monkeypatch):
     monkeypatch.setattr(main, "now_datetime_string", lambda: "08.05.2026 12:34")
 
