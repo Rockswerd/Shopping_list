@@ -1,5 +1,6 @@
 import os
 import re
+from difflib import SequenceMatcher
 from datetime import datetime
 from typing import Optional
 
@@ -15,6 +16,7 @@ except ImportError:
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+ALICE_APPLICATION_ID = os.getenv("ALICE_APPLICATION_ID")
 
 FINISH_WORDS = {
     "завершить",
@@ -42,6 +44,137 @@ FILLER_PATTERNS = [
     r"\bмне\b",
 ]
 
+NEGATIVE_ADD_PATTERNS = [
+    r"\bне\s+добавляй\b[^,]*(?:,|$)",
+    r"\bне\s+добавить\b[^,]*(?:,|$)",
+    r"\bне\s+записывай\b[^,]*(?:,|$)",
+    r"\bне\s+записать\b[^,]*(?:,|$)",
+    r"\bне\s+купи\b[^,]*(?:,|$)",
+    r"\bне\s+купить\b[^,]*(?:,|$)",
+]
+
+VIEW_LIST_COMMANDS = {
+    "что в списке",
+    "что у нас в списке",
+    "что в списке покупок",
+    "что в покупках",
+    "что я добавил",
+    "что я добавила",
+    "что уже добавил",
+    "что уже добавила",
+    "что я уже добавил",
+    "что я уже добавила",
+    "прочитай список",
+    "прочитай список покупок",
+    "покажи список",
+    "покажи список покупок",
+    "назови список",
+    "назови список покупок",
+    "назови покупки",
+    "перечисли список",
+    "перечисли покупки",
+    "какие покупки",
+    "какие товары в списке",
+    "список",
+    "покупки",
+}
+
+CLEAR_LIST_COMMANDS = {
+    "очисти список",
+    "очистить список",
+    "очисти список покупок",
+    "очистить список покупок",
+    "удали все",
+    "убери все",
+    "удали все из списка",
+    "убери все из списка",
+    "удали все покупки",
+    "убери все покупки",
+    "сотри все",
+    "сотри все покупки",
+    "сотри список",
+    "сбрось список",
+    "начать заново",
+    "начни заново",
+}
+
+UNDO_LAST_COMMANDS = {
+    "отмени последнее",
+    "отменить последнее",
+    "удали последнее",
+    "убери последнее",
+    "вычеркни последнее",
+    "последнее удали",
+    "последнее убери",
+    "последний пункт удали",
+    "последний пункт убери",
+    "убери последний пункт",
+    "удали последний пункт",
+    "откатить последнее",
+}
+
+DELETE_ITEM_PREFIXES = (
+    "удали ",
+    "удалить ",
+    "убери ",
+    "убрать ",
+    "вычеркни ",
+    "вычеркнуть ",
+)
+
+DELETE_ITEM_PATTERNS = [
+    r"^(?:удали|удалить|убери|убрать|вычеркни|вычеркнуть)\s+(?:из\s+)?(?:покупок|списка\s+покупок|списка)\s+(.+)$",
+    r"^(?:из\s+)?(?:покупок|списка\s+покупок|списка)\s+(?:удали|удалить|убери|убрать|вычеркни|вычеркнуть)\s+(.+)$",
+    r"^(.+?)\s+(?:удали|удалить|убери|убрать|вычеркни|вычеркнуть)(?:\s+из\s+(?:покупок|списка\s+покупок|списка))?$",
+]
+
+DELETE_ITEM_FILLER_PATTERNS = [
+    r"\bиз\s+списка\s+покупок\b",
+    r"\bиз\s+списка\b",
+    r"\bв\s+списке\s+покупок\b",
+    r"\bв\s+списке\b",
+]
+
+QUANTITY_WORDS = {
+    "один",
+    "одна",
+    "одно",
+    "два",
+    "две",
+    "три",
+    "четыре",
+    "пять",
+    "шесть",
+    "семь",
+    "восемь",
+    "девять",
+    "десять",
+    "пол",
+    "полтора",
+    "полторы",
+    "кг",
+    "килограмм",
+    "килограмма",
+    "килограммов",
+    "грамм",
+    "грамма",
+    "граммов",
+    "литр",
+    "литра",
+    "литров",
+    "бутылка",
+    "бутылки",
+    "бутылок",
+    "пачка",
+    "пачки",
+    "пачек",
+    "упаковка",
+    "упаковки",
+    "штука",
+    "штуки",
+    "штук",
+}
+
 app = FastAPI(title="Покупки домой")
 
 ACTIVE_SESSIONS: dict[str, dict] = {}
@@ -67,10 +200,24 @@ def now_date_string() -> str:
     return datetime.now().strftime("%d.%m.%Y")
 
 
+def now_datetime_string() -> str:
+    try:
+        if ZoneInfo is not None:
+            return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        pass
+    return datetime.now().strftime("%d.%m.%Y %H:%M")
+
+
 def extract_user_text(payload: AliceRequest) -> str:
     command = (payload.request.get("command") or "").strip()
     original_utterance = (payload.request.get("original_utterance") or "").strip()
     return command or original_utterance
+
+
+def get_application_id(payload: AliceRequest) -> str:
+    application = payload.session.get("application") or {}
+    return str(application.get("application_id") or payload.session.get("application_id") or "")
 
 
 def get_session_id(payload: AliceRequest) -> str:
@@ -103,8 +250,24 @@ def alice_response(
     return response
 
 
+def normalize_command(text: str) -> str:
+    text = text.lower().replace("ё", "е").strip()
+    text = re.sub(r"[.!?:;]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" ,")
+
+
+def is_authorized_alice_app(payload: AliceRequest) -> bool:
+    if not ALICE_APPLICATION_ID:
+        return True
+    return get_application_id(payload) == ALICE_APPLICATION_ID
+
+
 def clean_text(text: str) -> str:
-    text = text.lower().strip()
+    text = normalize_command(text)
+
+    for pattern in NEGATIVE_ADD_PATTERNS:
+        text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
 
     for pattern in FILLER_PATTERNS:
         text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
@@ -126,6 +289,9 @@ def split_short_plain_list(text: str) -> list[str]:
 
     if len(words) <= 1:
         return [text] if text else []
+
+    if any(word.isdigit() or word in QUANTITY_WORDS for word in words):
+        return [text]
 
     if 2 <= len(words) <= 4 and all(len(word) <= 12 for word in words):
         return words
@@ -154,14 +320,126 @@ def parse_items(text: str) -> list[str]:
     return cleaned_parts
 
 
-def build_telegram_message(items: list[str]) -> str:
-    title = f"🛒 Список покупок - {now_date_string()}"
-    if not items:
-        return f"{title}\n- пусто"
+def escape_telegram_markdown(text: str) -> str:
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!\\])", r"\\\1", text)
 
-    lines = [title]
-    lines.extend(f"- {item}" for item in items)
+
+def build_telegram_message(items: list[str]) -> str:
+    updated_at = escape_telegram_markdown(now_datetime_string())
+    title = "*Список покупок*"
+
+    if not items:
+        return f"{title}\n_Обновлено: {updated_at}_\n\n• пусто"
+
+    lines = [
+        title,
+        f"_Обновлено: {updated_at}_",
+        "",
+    ]
+    lines.extend(f"• {escape_telegram_markdown(item)}" for item in items)
     return "\n".join(lines)
+
+
+def format_items_for_alice(items: list[str]) -> str:
+    if not items:
+        return "Список пока пустой"
+
+    if len(items) == 1:
+        return f"В списке сейчас: {items[0]}"
+
+    return f"В списке сейчас: {', '.join(items)}"
+
+
+def build_added_response(items: list[str]) -> str:
+    added_text = ", ".join(items)
+    if len(items) == 1:
+        return f"Записала: {added_text}. Что еще добавить?"
+    return f"Добавила: {added_text}. Продолжайте или скажите завершить"
+
+
+def remember_response(session_data: dict, message_id: int, response_text: str, *, end_session: bool = False):
+    session_data["last_processed_message_id"] = message_id
+    session_data["last_response_text"] = response_text
+    session_data["last_end_session"] = end_session
+
+
+def detect_delete_item(text: str) -> Optional[str]:
+    normalized_text = normalize_command(text)
+
+    for pattern in DELETE_ITEM_PATTERNS:
+        match = re.match(pattern, normalized_text, flags=re.IGNORECASE)
+        if match:
+            item_text = match.group(1).strip()
+
+            for filler_pattern in DELETE_ITEM_FILLER_PATTERNS:
+                item_text = re.sub(filler_pattern, " ", item_text, flags=re.IGNORECASE)
+
+            return clean_text(item_text)
+
+    for prefix in DELETE_ITEM_PREFIXES:
+        if normalized_text.startswith(prefix):
+            item_text = normalized_text.removeprefix(prefix).strip()
+
+            for pattern in DELETE_ITEM_FILLER_PATTERNS:
+                item_text = re.sub(pattern, " ", item_text, flags=re.IGNORECASE)
+
+            return clean_text(item_text)
+
+    return None
+
+
+def similarity(left: str, right: str) -> float:
+    return SequenceMatcher(None, normalize_command(left), normalize_command(right)).ratio()
+
+
+def find_item_matches(existing_items: list[str], requested_item: str) -> list[str]:
+    normalized_requested = normalize_command(requested_item)
+    exact_matches = [
+        item for item in existing_items
+        if normalize_command(item) == normalized_requested
+    ]
+
+    if exact_matches:
+        return exact_matches
+
+    partial_matches = [
+        item for item in existing_items
+        if len(normalized_requested) >= 4 and normalized_requested in normalize_command(item)
+    ]
+
+    if partial_matches:
+        return partial_matches
+
+    fuzzy_matches = [
+        item for item in existing_items
+        if similarity(item, requested_item) >= 0.82
+    ]
+
+    return fuzzy_matches
+
+
+def remove_items(existing_items: list[str], requested_items: list[str]) -> tuple[list[str], list[str], list[str]]:
+    ambiguous_items = []
+    items_to_remove = set()
+
+    for requested_item in requested_items:
+        matches = find_item_matches(existing_items, requested_item)
+
+        if len(matches) == 1:
+            items_to_remove.add(normalize_command(matches[0]))
+        elif len(matches) > 1:
+            ambiguous_items.extend(matches)
+
+    remaining_items = []
+    removed_items = []
+
+    for item in existing_items:
+        if normalize_command(item) in items_to_remove:
+            removed_items.append(item)
+        else:
+            remaining_items.append(item)
+
+    return remaining_items, removed_items, ambiguous_items
 
 
 async def telegram_api_call(method: str, payload: dict) -> dict:
@@ -206,6 +484,7 @@ async def upsert_telegram_list(items: list[str], message_id: Optional[int]) -> i
             {
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": text,
+                "parse_mode": "MarkdownV2",
             },
         )
         new_message_id = int(data["result"]["message_id"])
@@ -221,6 +500,7 @@ async def upsert_telegram_list(items: list[str], message_id: Optional[int]) -> i
                 "chat_id": TELEGRAM_CHAT_ID,
                 "message_id": message_id,
                 "text": text,
+                "parse_mode": "MarkdownV2",
             },
         )
         return message_id
@@ -265,6 +545,14 @@ async def webhook(payload: AliceRequest) -> dict:
     log(f"ALICE REQUEST: session_id={session_id}, message_id={message_id}, new={payload.session.get('new')}")
     log(f"ALICE TEXT: {extract_user_text(payload)}")
 
+    if not is_authorized_alice_app(payload):
+        log(f"ALICE UNAUTHORIZED APPLICATION_ID: {get_application_id(payload)}")
+        return alice_response(
+            payload,
+            "Этот адрес не подключен к вашему навыку",
+            end_session=True,
+        )
+
     if not session_id:
         return alice_response(
             payload,
@@ -301,29 +589,152 @@ async def webhook(payload: AliceRequest) -> dict:
     telegram_message_id = session_data.get("telegram_message_id")
 
     user_text = extract_user_text(payload)
-    normalized_text = user_text.lower().strip()
+    normalized_text = normalize_command(user_text)
 
     if normalized_text in FINISH_WORDS:
+        response_text = "Готово. Список сохранен" if items else "Список пустой. Закрываю"
         if not items:
             ACTIVE_SESSIONS.pop(session_id, None)
             return alice_response(
                 payload,
-                "Список пустой. Закрываю",
+                response_text,
                 end_session=True,
             )
 
         ACTIVE_SESSIONS.pop(session_id, None)
         return alice_response(
             payload,
-            "Готово. Список сохранен",
+            response_text,
             end_session=True,
         )
 
     if not user_text:
         response_text = "Я не расслышала. Скажите, что добавить, или скажите завершить"
-        session_data["last_processed_message_id"] = message_id
-        session_data["last_response_text"] = response_text
-        session_data["last_end_session"] = False
+        remember_response(session_data, message_id, response_text)
+        return alice_response(
+            payload,
+            response_text,
+            session_state={"stage": "awaiting_items"},
+        )
+
+    if normalized_text in VIEW_LIST_COMMANDS:
+        response_text = format_items_for_alice(items)
+        remember_response(session_data, message_id, response_text)
+        return alice_response(
+            payload,
+            response_text,
+            session_state={"stage": "awaiting_items"},
+        )
+
+    if normalized_text in CLEAR_LIST_COMMANDS:
+        items = []
+        try:
+            if telegram_message_id is not None:
+                telegram_message_id = await upsert_telegram_list(items, telegram_message_id)
+        except Exception as exc:
+            log(f"FINAL TELEGRAM ERROR: {repr(exc)}")
+            response_text = "Не получилось очистить список в Телеграм. Попробуйте еще раз"
+            remember_response(session_data, message_id, response_text)
+            return alice_response(
+                payload,
+                response_text,
+                session_state={"stage": "awaiting_items"},
+            )
+
+        response_text = "Очистила список. Можно начинать заново"
+        session_data["items"] = items
+        session_data["telegram_message_id"] = telegram_message_id
+        remember_response(session_data, message_id, response_text)
+        return alice_response(
+            payload,
+            response_text,
+            session_state={"stage": "awaiting_items"},
+        )
+
+    if normalized_text in UNDO_LAST_COMMANDS:
+        if not items:
+            response_text = "Отменять нечего, список пустой"
+            remember_response(session_data, message_id, response_text)
+            return alice_response(
+                payload,
+                response_text,
+                session_state={"stage": "awaiting_items"},
+            )
+
+        removed_item = items[-1]
+        items = items[:-1]
+
+        try:
+            telegram_message_id = await upsert_telegram_list(items, telegram_message_id)
+        except Exception as exc:
+            log(f"FINAL TELEGRAM ERROR: {repr(exc)}")
+            response_text = "Не получилось обновить список в Телеграм. Попробуйте еще раз"
+            remember_response(session_data, message_id, response_text)
+            return alice_response(
+                payload,
+                response_text,
+                session_state={"stage": "awaiting_items"},
+            )
+
+        response_text = f"Убрала последнее: {removed_item}"
+        session_data["items"] = items
+        session_data["telegram_message_id"] = telegram_message_id
+        remember_response(session_data, message_id, response_text)
+        return alice_response(
+            payload,
+            response_text,
+            session_state={"stage": "awaiting_items"},
+        )
+
+    delete_item_text = detect_delete_item(user_text)
+    if delete_item_text:
+        requested_items = parse_items(delete_item_text)
+
+        if not requested_items:
+            response_text = "Скажите, что именно убрать из списка"
+            remember_response(session_data, message_id, response_text)
+            return alice_response(
+                payload,
+                response_text,
+                session_state={"stage": "awaiting_items"},
+            )
+
+        items, removed_items, ambiguous_items = remove_items(items, requested_items)
+
+        if ambiguous_items:
+            response_text = f"Нашла несколько похожих товаров: {', '.join(ambiguous_items)}. Назовите точнее"
+            remember_response(session_data, message_id, response_text)
+            return alice_response(
+                payload,
+                response_text,
+                session_state={"stage": "awaiting_items"},
+            )
+
+        if not removed_items:
+            response_text = f"Не нашла в списке: {', '.join(requested_items)}"
+            remember_response(session_data, message_id, response_text)
+            return alice_response(
+                payload,
+                response_text,
+                session_state={"stage": "awaiting_items"},
+            )
+
+        try:
+            telegram_message_id = await upsert_telegram_list(items, telegram_message_id)
+        except Exception as exc:
+            log(f"FINAL TELEGRAM ERROR: {repr(exc)}")
+            response_text = "Не получилось обновить список в Телеграм. Попробуйте еще раз"
+            remember_response(session_data, message_id, response_text)
+            return alice_response(
+                payload,
+                response_text,
+                session_state={"stage": "awaiting_items"},
+            )
+
+        response_text = f"Убрала: {', '.join(removed_items)}"
+        session_data["items"] = items
+        session_data["telegram_message_id"] = telegram_message_id
+        remember_response(session_data, message_id, response_text)
         return alice_response(
             payload,
             response_text,
@@ -335,9 +746,7 @@ async def webhook(payload: AliceRequest) -> dict:
 
     if not new_items:
         response_text = "Не поняла, что добавить. Скажите товар еще раз"
-        session_data["last_processed_message_id"] = message_id
-        session_data["last_response_text"] = response_text
-        session_data["last_end_session"] = False
+        remember_response(session_data, message_id, response_text)
         return alice_response(
             payload,
             response_text,
@@ -354,9 +763,7 @@ async def webhook(payload: AliceRequest) -> dict:
         response_text = "Не получилось обновить список в Телеграм. Попробуйте еще раз"
         session_data["items"] = items
         session_data["telegram_message_id"] = telegram_message_id
-        session_data["last_processed_message_id"] = message_id
-        session_data["last_response_text"] = response_text
-        session_data["last_end_session"] = False
+        remember_response(session_data, message_id, response_text)
         return alice_response(
             payload,
             response_text,
@@ -364,14 +771,11 @@ async def webhook(payload: AliceRequest) -> dict:
             session_state={"stage": "awaiting_items"},
         )
 
-    added_text = ", ".join(new_items)
-    response_text = f"Добавила: {added_text}. Говорите еще или скажите завершить"
+    response_text = build_added_response(new_items)
 
     session_data["items"] = items
     session_data["telegram_message_id"] = telegram_message_id
-    session_data["last_processed_message_id"] = message_id
-    session_data["last_response_text"] = response_text
-    session_data["last_end_session"] = False
+    remember_response(session_data, message_id, response_text)
 
     log(f"SESSION UPDATED: items={items}, telegram_message_id={telegram_message_id}")
 
