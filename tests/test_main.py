@@ -29,7 +29,9 @@ def test_parse_items_handles_fillers_lists_quantities_and_negative_phrases():
     assert main.parse_items("Алиса, добавь молоко, хлеб и яйца") == ["молоко", "хлеб", "яйца"]
     assert main.parse_items("молоко хлеб яйца") == ["молоко", "хлеб", "яйца"]
     assert main.parse_items("добавь два литра молока и батон") == ["два литра молока", "батон"]
+    assert main.parse_items("десяток яиц") == ["десяток яиц"]
     assert main.parse_items("не добавляй хлеб, добавь молоко") == ["молоко"]
+    assert main.parse_items("здравствуйте") == []
 
 
 def test_parse_items_keeps_adjective_product_names_together():
@@ -323,6 +325,23 @@ def test_duplicate_request_returns_previous_response_without_updating_telegram(m
     response = run_webhook(make_payload("молоко", message_id=2))
 
     assert response["response"]["text"] == "Записала: молоко. Что еще добавить?"
+
+
+def test_finish_command_accepts_zavershi():
+    main.ACTIVE_SESSIONS.clear()
+    main.ACTIVE_SESSIONS["session-1"] = {
+        "items": ["молоко"],
+        "telegram_message_id": 10,
+        "last_processed_message_id": None,
+        "last_response_text": "",
+        "last_end_session": False,
+    }
+
+    response = run_webhook(make_payload("заверши", message_id=2))
+
+    assert response["response"]["text"] == "Готово. Список сохранен"
+    assert response["response"]["end_session"] is True
+    assert "session-1" not in main.ACTIVE_SESSIONS
 
 
 def test_application_id_check_rejects_foreign_skill(monkeypatch):
